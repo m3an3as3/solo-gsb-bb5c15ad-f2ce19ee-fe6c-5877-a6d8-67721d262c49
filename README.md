@@ -53,6 +53,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | GET | `/events/{id}` | 事件详情 |
 | POST | `/events/{id}/extend` | 受约束地延长两个截止时间（仅 commit 阶段，幂等） |
 | POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
+| POST | `/events/schedule` | 批量事件 commit/reveal 窗口的最少 track 资源排程（确定性区间着色） |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
@@ -200,6 +201,78 @@ curl -s -X POST http://localhost:8000/events/conflicts \
 `{"generated_at": "...", "phases": ["commit", "reveal"], "count": 0, "segments": []}`。
 请求中的重复 ID 自动去重；任一 ID 不存在返回 `404 EVENT_NOT_FOUND`；非 UUID 返回 422。
 
+## 资源排程（`POST /events/schedule`）
+
+在冲突分析的同一套半开窗口语义上，为一批事件安排「轨道（track）」资源：每个事件的
+commit 与 reveal 两个阶段窗口**分别独立**做最少轨道数的确定性区间着色，保证同一 track
+上同一阶段的窗口互不重叠，而首尾相接（前一窗口的右端点恰为后一窗口的左端点）可直接
+复用同一 track：
+
+```
+commit: [created_at, commit_deadline)
+reveal: [commit_deadline, reveal_deadline)
+```
+
+贪心区间着色对区间图是**最优**的：每个阶段实际所需的最少 track 数恰为该阶段任意时刻
+最大同时重叠窗口数；整体 `required_tracks` 取 commit / reveal 两阶段需求的最大值。
+区间按「开始时刻 → 结束时刻 → 事件 ID」排序、优先复用编号最小的空闲 track（从 1 起
+连续编号），因此**相同输入重复请求返回完全一致的结果**，与请求中 ID 的排列顺序无关。
+该端点为只读计算，**不修改任何事件数据**。
+
+请求体：
+
+- `event_ids`：事件 ID 列表，重复 ID 自动去重；空列表（或省略字段）稳定返回
+  `required_tracks: 0` 的空排程；任一 ID 不存在返回 `404 EVENT_NOT_FOUND`；
+- `track_limit`：可用 track 数，**必须为正整数**（`0` / 负数返回
+  `400 INVALID_TRACK_LIMIT`；缺失或非整数返回 422）。
+
+当 `required_tracks <= track_limit` 时 `feasible=true`、`conflict_pairs` 为空；
+否则 `feasible=false`，`conflict_pairs` 列出**超载片段**内同阶段重叠的事件对
+（每个事件对给出 `phase` 与较小/较大的两个事件 ID，按 `phase` 与事件 ID 排序；
+同一对事件若在两个阶段都冲突会各出现一项）。`assignments` 无论是否可行都返回，
+并按 `event_id` 升序排列。
+
+```bash
+curl -s -X POST http://localhost:8000/events/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>", "<EVENT_ID_3>"],
+       "track_limit": 2}'
+```
+
+```json
+{
+  "generated_at": "2030-06-01T00:00:00Z",
+  "phases": ["commit", "reveal"],
+  "track_limit": 2,
+  "required_tracks": 2,
+  "feasible": true,
+  "assignments": [
+    {"event_id": "<EVENT_ID_1>", "commit_track": 1, "reveal_track": 1},
+    {"event_id": "<EVENT_ID_2>", "commit_track": 2, "reveal_track": 2},
+    {"event_id": "<EVENT_ID_3>", "commit_track": 1, "reveal_track": 1}
+  ],
+  "conflict_pairs": []
+}
+```
+
+上例中事件 3 与事件 1 首尾相接（事件 1 的窗口结束恰为事件 3 的开始），因此两者复用
+同一 track。把 `track_limit` 改为 1 而三窗口存在两两重叠时，将得到
+`feasible: false` 与冲突对清单：
+
+```json
+{
+  "generated_at": "2030-06-01T00:00:00Z",
+  "phases": ["commit", "reveal"],
+  "track_limit": 1,
+  "required_tracks": 3,
+  "feasible": false,
+  "assignments": [ ... ],
+  "conflict_pairs": [
+    {"phase": "commit", "event_id_a": "<ID_A>", "event_id_b": "<ID_B>"}
+  ]
+}
+```
+
 ## 原子批量提交承诺（`POST /events/{id}/commitments/batch`）
 
 在**单个数据库事务**中按输入顺序提交 1～100 个承诺哈希。服务端在写入前完成全部校验，
@@ -336,6 +409,7 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
 | HTTP | code | 场景 |
 |------|------|------|
 | 400 | `INVALID_DEADLINES` | 截止时间顺序非法或 commit_deadline 不在未来 |
+| 400 | `INVALID_TRACK_LIMIT` | `/events/schedule` 的 track_limit 不是正整数（0 或负数） |
 | 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析请求中的任一 ID） |
 | 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 延长截止时间时事件已离开 commit 阶段（reveal / closed） |
 | 409 | `INVALID_EXTENSION` | 延长请求未满足「只延不缩」或 reveal 须晚于新 commit 的约束 |
@@ -403,13 +477,14 @@ python3 -m pytest tests/ -q                                     # 运行测试�
 ```
 app/
   main.py       # 路由、生命周期、时间判定与错误处理
-  conflicts.py  # 阶段窗口 sweep-line 冲突分析（纯函数，可独立单测）
+  conflicts.py  # 阶段窗口 sweep-line 冲突分析与最少 track 区间着色（纯函数，可独立单测）
   models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
 tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
+tests/test_schedule.py        # 资源排程：最少轨道着色、半开复用、确定性与超载冲突对
 tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效

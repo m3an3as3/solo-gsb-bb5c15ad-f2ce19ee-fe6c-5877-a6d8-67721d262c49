@@ -160,6 +160,44 @@ class ConflictsOut(BaseModel):
     segments: list[ConflictSegmentOut]
 
 
+class ScheduleRequest(BaseModel):
+    event_ids: list[UUID] = Field(
+        default_factory=list,
+        description="待排程的事件 ID 列表（重复 ID 自动去重，空列表返回空排程）",
+    )
+    track_limit: int = Field(
+        description="可用 track 数量（正整数）；最小需求超过该值时返回冲突事件对"
+    )
+
+
+class ScheduleAssignmentOut(BaseModel):
+    event_id: UUID
+    commit_track: int = Field(description="commit 窗口 [created_at, commit_deadline) 分配的 track（1 起）")
+    reveal_track: int = Field(description="reveal 窗口 [commit_deadline, reveal_deadline) 分配的 track（1 起）")
+
+
+class ScheduleConflictPairOut(BaseModel):
+    phase: str  # commit | reveal
+    event_id_a: UUID = Field(description="冲突对中较小的事件 ID")
+    event_id_b: UUID = Field(description="冲突对中较大的事件 ID")
+
+
+class ScheduleOut(BaseModel):
+    generated_at: datetime
+    phases: list[str]
+    track_limit: int = Field(description="请求给定的可用 track 数")
+    required_tracks: int = Field(
+        description="最少所需 track 数（commit / reveal 两阶段各自最少需求的最大值）"
+    )
+    feasible: bool = Field(description="required_tracks <= track_limit 时为 true")
+    assignments: list[ScheduleAssignmentOut] = Field(
+        description="按 event_id 升序的每事件 track 分配（两阶段独立着色）"
+    )
+    conflict_pairs: list[ScheduleConflictPairOut] = Field(
+        description="track 上限无法满足时，超载片段内同阶段重叠的事件对（按 phase 与事件 ID 排序）；可行时为空"
+    )
+
+
 class HashOut(BaseModel):
     commitment_hash: str
     hash_scheme: str

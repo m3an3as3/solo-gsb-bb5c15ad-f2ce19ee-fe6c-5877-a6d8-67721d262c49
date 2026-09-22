@@ -17,7 +17,14 @@ from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
-from .conflicts import COMMIT, REVEAL, PhaseWindow, sweep_conflicts
+from .conflicts import (
+    COMMIT,
+    REVEAL,
+    PhaseWindow,
+    overload_pairs,
+    schedule_tracks,
+    sweep_conflicts,
+)
 from .database import Base, engine, get_db
 from .hashing import HASH_SCHEME, compute_commitment
 from .models import Commitment, DeadlineExtension, Event, Reveal
@@ -38,6 +45,8 @@ from .schemas import (
     RevealBatchOut,
     RevealCreate,
     RevealOut,
+    ScheduleRequest,
+    ScheduleOut,
     TimelineOut,
 )
 
@@ -361,6 +370,94 @@ def analyze_event_conflicts(payload: ConflictRequest, db: Session = Depends(get_
             }
             for s in segments
         ],
+    )
+
+
+@app.post("/events/schedule", response_model=ScheduleOut)
+def schedule_event_tracks(payload: ScheduleRequest, db: Session = Depends(get_db)):
+    """为多个事件的阶段窗口做最少轨道的确定性排程（只读，不修改事件数据）。
+
+    每个事件按服务端 UTC 视为两段半开区间：
+      commit: [created_at, commit_deadline)
+      reveal: [commit_deadline, reveal_deadline)
+
+    两个阶段各自独立做区间着色（贪心最优选，最少轨道数恰为该阶段的
+    最大同时重叠数）：同一 track 同一阶段的区间互不重叠，半开边界下
+    首尾相接（前一区间结束恰为后一区间开始）可直接复用同一 track。
+    编号规则（区间按开始/结束/事件 ID 排序，优先复用最小编号的空闲
+    track）保证相同输入重复请求得到完全一致的结果。
+
+    请求中的重复 ID 去重；任一 ID 不存在返回 404；track_limit 不是正
+    整数返回 400 INVALID_TRACK_LIMIT；空列表稳定返回 required=0 的
+    空排程。两阶段最少需求的最大值为整体 required_tracks；当其超过
+    track_limit 时 feasible=false，并给出超载片段内的同阶段冲突事件对。
+    """
+    now = now_utc()
+    if payload.track_limit < 1:
+        raise api_error(
+            400,
+            "INVALID_TRACK_LIMIT",
+            f"可用 track 数必须为正整数，收到 {payload.track_limit!r}",
+        )
+
+    # 保序去重：同一事件只参与一次排程
+    event_ids = list(dict.fromkeys(payload.event_ids))
+
+    events_by_id: dict[UUID, Event] = {}
+    if event_ids:
+        events = db.query(Event).filter(Event.id.in_(event_ids)).all()
+        events_by_id = {e.id: e for e in events}
+    missing = next((eid for eid in event_ids if eid not in events_by_id), None)
+    if missing is not None:
+        raise api_error(404, "EVENT_NOT_FOUND", f"事件 {missing} 不存在")
+
+    windows: list[PhaseWindow] = []
+    for event in (events_by_id[eid] for eid in event_ids):
+        created = as_utc(event.created_at)
+        commit_dl = as_utc(event.commit_deadline)
+        reveal_dl = as_utc(event.reveal_deadline)
+        windows.append(PhaseWindow(event.id, COMMIT, created, commit_dl))
+        windows.append(PhaseWindow(event.id, REVEAL, commit_dl, reveal_dl))
+
+    assignments_by_phase, required_by_phase = schedule_tracks(windows)
+    commit_tracks = {a.event_id: a.track for a in assignments_by_phase.get(COMMIT, [])}
+    reveal_tracks = {a.event_id: a.track for a in assignments_by_phase.get(REVEAL, [])}
+
+    required_tracks = max(
+        (required_by_phase.get(phase, 0) for phase in (COMMIT, REVEAL)),
+        default=0,
+    )
+    feasible = required_tracks <= payload.track_limit
+
+    conflict_pairs = (
+        []
+        if feasible
+        else [
+            {
+                "phase": p.phase,
+                "event_id_a": p.event_id_a,
+                "event_id_b": p.event_id_b,
+            }
+            for p in overload_pairs(windows, payload.track_limit)
+        ]
+    )
+
+    assignments = [
+        {
+            "event_id": eid,
+            "commit_track": commit_tracks.get(eid, 1),
+            "reveal_track": reveal_tracks.get(eid, 1),
+        }
+        for eid in sorted(events_by_id)
+    ]
+    return ScheduleOut(
+        generated_at=now,
+        phases=[COMMIT, REVEAL],
+        track_limit=payload.track_limit,
+        required_tracks=required_tracks,
+        feasible=feasible,
+        assignments=assignments,
+        conflict_pairs=conflict_pairs,
     )
 
 
