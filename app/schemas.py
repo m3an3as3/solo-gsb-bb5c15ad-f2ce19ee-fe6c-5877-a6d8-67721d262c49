@@ -160,6 +160,46 @@ class ConflictsOut(BaseModel):
     segments: list[ConflictSegmentOut]
 
 
+class ScheduleRequest(BaseModel):
+    event_ids: list[UUID] = Field(
+        default_factory=list,
+        description="待排程的事件 ID 列表（重复 ID 自动去重，空列表返回空结果）",
+    )
+    # 不用 int 类型约束：非法上限（缺失、null、非整数、布尔、小于 1）须走统一
+    # 错误结构（api_error 的 400 INVALID_TRACK_LIMIT），而不是 pydantic 的 422
+    track_limit: Any = Field(default=None, description="可用 track 数（>= 1 的整数）")
+
+
+class ScheduleAssignmentOut(BaseModel):
+    event_id: UUID
+    commit_track: Optional[int] = Field(
+        description="commit 阶段分配的轨道（1 起编号）；零长度窗口为 null"
+    )
+    reveal_track: Optional[int] = Field(
+        description="reveal 阶段分配的轨道（1 起编号，与 commit 轨道相互独立）；零长度窗口为 null"
+    )
+
+
+class ScheduleConflictPairOut(BaseModel):
+    phase: str  # commit | reveal
+    event_id_1: UUID = Field(description="冲突对中按 UUID 升序的第一个事件")
+    event_id_2: UUID = Field(description="冲突对中按 UUID 升序的第二个事件")
+
+
+class ScheduleOut(BaseModel):
+    track_limit: int = Field(description="请求的可用 track 数")
+    required_tracks: int = Field(
+        description="最小所需 track 数（commit / reveal 两阶段各自最大并发深度的较大值）"
+    )
+    feasible: bool = Field(description="最小所需轨道数是否不超过 track_limit")
+    assignments: list[ScheduleAssignmentOut] = Field(
+        description="按 event_id 升序的逐事件轨道分配"
+    )
+    conflicts: list[ScheduleConflictPairOut] = Field(
+        description="feasible=false 时导致超出上限的同阶段冲突事件对（去重排序）；feasible=true 时为空"
+    )
+
+
 class HashOut(BaseModel):
     commitment_hash: str
     hash_scheme: str

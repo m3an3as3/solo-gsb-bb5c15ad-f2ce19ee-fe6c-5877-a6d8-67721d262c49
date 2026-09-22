@@ -53,6 +53,7 @@ curl -s -X POST http://localhost:8000/utils/commitment \
 | GET | `/events/{id}` | 事件详情 |
 | POST | `/events/{id}/extend` | 受约束地延长两个截止时间（仅 commit 阶段，幂等） |
 | POST | `/events/conflicts` | 批量事件的阶段窗口冲突分析（sweep-line） |
+| POST | `/events/schedule` | 批量事件的阶段窗口资源排程（最少轨道确定性着色） |
 | POST | `/events/{id}/commitments` | 提交承诺（64 位十六进制哈希） |
 | POST | `/events/{id}/commitments/batch` | 原子批量提交 1～100 个承诺（单事务，冲突整体回滚） |
 | GET | `/events/{id}/commitments` | 承诺列表（含是否已揭示） |
@@ -200,6 +201,74 @@ curl -s -X POST http://localhost:8000/events/conflicts \
 `{"generated_at": "...", "phases": ["commit", "reveal"], "count": 0, "segments": []}`。
 请求中的重复 ID 自动去重；任一 ID 不存在返回 `404 EVENT_NOT_FOUND`；非 UUID 返回 422。
 
+## 事件窗口资源排程（`POST /events/schedule`）
+
+为若干事件的两阶段半开窗口安排 **track（轨道）**：同一 track、同一阶段的两个窗口
+不得重叠；commit 与 reveal **分别独立着色**（两套轨道编号互不影响，均从 1 开始）。
+窗口定义与半开语义同冲突分析：
+
+```
+commit: [created_at, commit_deadline)
+reveal: [commit_deadline, reveal_deadline)
+```
+
+首尾相接（前一窗口右端点恰为后一窗口左端点）不重叠，**可复用同一 track**。排程按
+`(起点, 终点, event_id)` 升序做确定性贪心着色（结束窗口先离场、再取编号最小的空闲
+track），所用 track 数等于该阶段的最大并发深度，即**最小所需轨道数**；响应中的
+`required_tracks` 取 commit / reveal 两阶段的较大值。请求体携带去重后的事件 ID 与
+可用 track 数 `track_limit`（>= 1 的整数）：
+
+```bash
+curl -s -X POST http://localhost:8000/events/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{"event_ids": ["<EVENT_ID_1>", "<EVENT_ID_2>", "<EVENT_ID_3>"],
+       "track_limit": 2}'
+```
+
+```json
+{
+  "track_limit": 2,
+  "required_tracks": 3,
+  "feasible": false,
+  "assignments": [
+    {"event_id": "<EVENT_ID_1>", "commit_track": 1, "reveal_track": 1},
+    {"event_id": "<EVENT_ID_2>", "commit_track": 2, "reveal_track": 2},
+    {"event_id": "<EVENT_ID_3>", "commit_track": 3, "reveal_track": 3}
+  ],
+  "conflicts": [
+    {"phase": "commit", "event_id_1": "<EVENT_ID_1>", "event_id_2": "<EVENT_ID_2>"},
+    {"phase": "commit", "event_id_1": "<EVENT_ID_1>", "event_id_2": "<EVENT_ID_3>"},
+    {"phase": "commit", "event_id_1": "<EVENT_ID_2>", "event_id_2": "<EVENT_ID_3>"},
+    {"phase": "reveal", "event_id_1": "<EVENT_ID_1>", "event_id_2": "<EVENT_ID_2>"},
+    {"phase": "reveal", "event_id_1": "<EVENT_ID_1>", "event_id_2": "<EVENT_ID_3>"},
+    {"phase": "reveal", "event_id_1": "<EVENT_ID_2>", "event_id_2": "<EVENT_ID_3>"}
+  ]
+}
+```
+
+字段与语义：
+
+- `required_tracks`：排下所有窗口所需的最小 track 数（两阶段最大并发深度的较大值）；
+- `feasible`：`required_tracks <= track_limit` 时为 `true`，HTTP 状态码始终为 200；
+- `assignments`：按 `event_id` 升序返回每个事件的 `commit_track` / `reveal_track`
+  （1 起编号；零长度阶段窗口不占任何时刻，对应编号为 `null`）；
+- `conflicts`：`feasible=false` 时给出导致超出上限的冲突事件对——即某阶段并发窗口数
+  **严格多于** `track_limit` 的时间片段内同时活动的每一对事件（同阶段、半开重叠；
+  跨片段去重，按 `phase`、`event_id_1`、`event_id_2` 排序，对内 ID 升序）；
+  `feasible=true` 时恒为空数组。注意：仅普通两两重叠、但从未超过上限的事件对
+  **不在**此列（上限内排得下即不算阻塞冲突）。
+
+确定性与只读：响应只取决于各事件当前的窗口与 `track_limit`，不含任何时间戳字段，
+**相同输入重复请求（含打乱/重复 ID 的等价输入）结果逐字节一致**；排程不写入数据库，
+不修改任何事件数据。
+
+| HTTP | code | 场景 |
+|------|------|------|
+| 200 | — | 排程成功（`feasible=false` 同样返回 200，冲突见 `conflicts`） |
+| 400 | `INVALID_TRACK_LIMIT` | `track_limit` 缺失、为 null、不是整数（含布尔值）或小于 1 |
+| 404 | `EVENT_NOT_FOUND` | 请求中的任一事件 ID 不存在 |
+| 422 | — | 事件 ID 非 UUID 或请求体结构错误 |
+
 ## 原子批量提交承诺（`POST /events/{id}/commitments/batch`）
 
 在**单个数据库事务**中按输入顺序提交 1～100 个承诺哈希。服务端在写入前完成全部校验，
@@ -336,7 +405,8 @@ curl -s -X POST http://localhost:8000/events/<EVENT_ID>/reveals/batch \
 | HTTP | code | 场景 |
 |------|------|------|
 | 400 | `INVALID_DEADLINES` | 截止时间顺序非法或 commit_deadline 不在未来 |
-| 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析请求中的任一 ID） |
+| 400 | `INVALID_TRACK_LIMIT` | 资源排程的 track_limit 缺失、非整数（含布尔值）或小于 1 |
+| 404 | `EVENT_NOT_FOUND` | 事件不存在（含冲突分析/资源排程请求中的任一 ID） |
 | 409 | `EXTENSION_NOT_IN_COMMIT_PHASE` | 延长截止时间时事件已离开 commit 阶段（reveal / closed） |
 | 409 | `INVALID_EXTENSION` | 延长请求未满足「只延不缩」或 reveal 须晚于新 commit 的约束 |
 | 409 | `COMMIT_PHASE_CLOSED` | 迟到提交（已过 commit_deadline） |
@@ -404,12 +474,14 @@ python3 -m pytest tests/ -q                                     # 运行测试�
 app/
   main.py       # 路由、生命周期、时间判定与错误处理
   conflicts.py  # 阶段窗口 sweep-line 冲突分析（纯函数，可独立单测）
+  scheduling.py # 阶段窗口资源排程：最少轨道的确定性区间着色（纯函数，可独立单测）
   models.py     # SQLAlchemy 模型（events / commitments / reveals / deadline_extensions）
   schemas.py    # Pydantic 请求/响应模型
   hashing.py    # 承诺哈希方案实现
   database.py   # 引擎与会话（DATABASE_URL 可配置）
 tests/test_api.py             # 业务规则冒烟测试（SQLite + 模拟时钟）
 tests/test_conflicts.py       # 冲突分析：sweep-line 边界、排序与 API 用例
+tests/test_schedule.py        # 资源排程：最少轨道着色、半开复用、冲突对与确定性
 tests/test_extend.py          # 截止时间延长：只延不缩、阶段限制、幂等与时间线
 tests/test_batch_commitments.py  # 批量承诺：逐项冲突、整体回滚与并发兜底
 tests/test_batch_reveals.py   # 批量揭示：四类逐项冲突、整体回滚与并发仅首次生效
